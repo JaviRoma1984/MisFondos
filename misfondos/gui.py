@@ -1550,6 +1550,9 @@ class MisFondosApp:
         self._table_sort = (None, True)  # (columna, descendente); None = orden de la lista
         self._risk_sort = (None, True)   # lo mismo para la tabla de riesgo
         self._last_refresh = None
+        self._next_auto_refresh = None  # la pone la actualización automática
+        self._last_new_navs = None      # (cuándo, [fondos]) del último VL nuevo descargado
+        self._status_text = ""          # texto de estado de la barra lateral (sobrevive a un cambio de tema)
 
         # Icono junto al reloj: se crea antes del primer dibujado para que este ya
         # le ponga el resumen de la cartera. Si falla, el programa sigue igual que
@@ -1750,14 +1753,15 @@ class MisFondosApp:
             fg_color="transparent", border_width=BORDER_W, border_color=c["border"], hover_color=c["bg_card_hover"],
             text_color=c["text_muted"], font=FONT_SMALL, command=self._remove_selected,
         ).pack(fill="x", pady=3)
-        ctk.CTkButton(
-            btn_frame, text="↻  Actualizar ahora", height=34, corner_radius=10,
-            fg_color="transparent", border_width=BORDER_W, border_color=c["border"], hover_color=c["bg_card_hover"],
-            text_color=c["text_muted"], font=FONT_SMALL, command=self._manual_refresh,
-        ).pack(fill="x", pady=3)
+        # Sin botón "Actualizar ahora": se actualiza solo (ver _start_scheduler) y el
+        # estado de debajo dice cuándo fue la última vez y cuándo será la próxima. Para
+        # forzarlo en algún caso raro queda la opción del menú del icono del reloj.
 
+        # Con el último estado: al cambiar de tema se reconstruye y, si empezara vacía,
+        # no volvería a decir nada hasta la siguiente actualización (15 min después).
         self.status_label = ctk.CTkLabel(
-            sidebar, text="", font=FONT_SMALL, text_color=c["text_muted"], wraplength=250, justify="left", anchor="w"
+            sidebar, text=self._status_text, font=FONT_SMALL, text_color=c["text_muted"], wraplength=250,
+            justify="left", anchor="w"
         )
         self.status_label.pack(fill="x", padx=18, pady=(6, 16))
 
@@ -1947,7 +1951,7 @@ class MisFondosApp:
         """entries: [(fondo, rentabilidad en el periodo o None)] en el orden de la gráfica."""
         c = self.colors
         self.legend_caption.configure(
-            text=f"Fondos de la gráfica · rentabilidad {PERIOD_PHRASES.get(self.period.get(), '').lower()}")
+            text=f"Del más al menos rentable {PERIOD_PHRASES.get(self.period.get(), '').lower()}")
         for w in self.legend_scroll.winfo_children():
             w.destroy()
         if not entries:
@@ -2562,13 +2566,27 @@ class MisFondosApp:
             self.reload_funds()
 
     # ---------- refresco ----------
+    def _set_status(self, text):
+        self._status_text = text
+        if not self._rebuilding:
+            self.status_label.configure(text=text)
+
     def _manual_refresh(self):
-        self.status_label.configure(text="Actualizando...")
+        self._set_status("Actualizando...")
         threading.Thread(target=self._background_refresh, daemon=True).start()
 
-    def _background_refresh(self):
+    @staticmethod
+    def _last_nav_date(fund_id):
+        closes = data_fetcher.load_history(fund_id)["Close"].dropna()
+        return closes.index[-1] if len(closes) else None
+
+    def _background_refresh(self, automatic=False):
+        """Descarga los VL nuevos. La llama sola el programador cada
+        REFRESH_INTERVAL_SECONDS (automatic=True) y, además, la opción «Actualizar
+        ahora» del menú del icono del reloj y el cambio de usuario."""
         funds = store.list_funds()
         errors = []
+        before = {f["id"]: self._last_nav_date(f["id"]) for f in funds}
 
         def on_progress(fund, error):
             if error:
@@ -2579,13 +2597,29 @@ class MisFondosApp:
             data_fetcher.refresh_all(funds, on_progress=on_progress)
         except Exception:
             applog.log_exception("Fallo general al actualizar los fondos")
+        updated = [f["name"] for f in funds
+                   if self._last_nav_date(f["id"]) is not None and self._last_nav_date(f["id"]) != before[f["id"]]]
+        applog.info("Actualización %s: %d fondo(s); valor liquidativo nuevo en: %s",
+                    "automática" if automatic else "manual", len(funds), ", ".join(updated) or "ninguno")
         self._last_refresh = dt.datetime.now()
-        now = self._last_refresh.strftime("%d/%m/%Y %H:%M")
+        if automatic:
+            # El programador espera un intervalo justo después de esta llamada.
+            self._next_auto_refresh = self._last_refresh + dt.timedelta(seconds=config.REFRESH_INTERVAL_SECONDS)
+        lines = [f"Última actualización: {self._last_refresh:%d/%m/%Y %H:%M}"]
+        if updated:
+            self._last_new_navs = (self._last_refresh, updated)
+        if self._last_new_navs:
+            # Se queda a la vista hasta que llegue otro: así se ve cuándo entró el último dato.
+            when, names = self._last_new_navs
+            short = [n if len(n) <= 26 else n[:25].rstrip() + "…" for n in names]
+            day = "" if when.date() == self._last_refresh.date() else f"{when:%d/%m} "
+            lines.append(f"Último valor liquidativo nuevo: {', '.join(short)} ({day}{when:%H:%M})")
         if errors:
-            msg = f"Última actualización: {now}\nFallo en: {', '.join(errors)}"
-        else:
-            msg = f"Última actualización: {now}"
-        self._ui_queue.put(("status", msg))
+            lines.append(f"Fallo en: {', '.join(errors)}")
+        if self._next_auto_refresh:
+            lines.append(f"Se actualiza solo cada {config.REFRESH_INTERVAL_SECONDS // 60} min · "
+                         f"próxima a las {self._next_auto_refresh:%H:%M}")
+        self._ui_queue.put(("status", "\n".join(lines)))
         self._ui_queue.put(("redraw", None))
         self._ui_queue.put(("alerts", None))
 
@@ -2605,11 +2639,14 @@ class MisFondosApp:
             self.tray.notify(*_alert_notification(new))
 
     def _start_scheduler(self):
+        """Actualización automática y continua: al arrancar y luego cada
+        REFRESH_INTERVAL_SECONDS, mientras el programa esté en marcha (también
+        escondido junto al reloj). Un VL recién publicado aparece como mucho un
+        intervalo después, sin tocar nada."""
         def loop():
-            self._background_refresh()
             while True:
+                self._background_refresh(automatic=True)
                 threading.Event().wait(config.REFRESH_INTERVAL_SECONDS)
-                self._background_refresh()
 
         threading.Thread(target=loop, daemon=True).start()
 
@@ -2633,11 +2670,14 @@ class MisFondosApp:
                 if kind == "alerts":  # no toca la interfaz: nunca se descarta
                     self._check_alerts()
                     continue
+                if kind == "status":
+                    # Se guarda siempre (la barra lateral nueva de un cambio de tema lo
+                    # recoge al crearse); solo se pinta si la interfaz no se está rehaciendo.
+                    self._set_status(payload)
+                    continue
                 if self._rebuilding:
                     continue  # se descarta: la interfaz se está reconstruyendo (cambio de tema)
-                if kind == "status":
-                    self.status_label.configure(text=payload)
-                elif kind == "redraw":
+                if kind == "redraw":
                     self._redraw()
         except queue.Empty:
             pass
@@ -3012,7 +3052,9 @@ class MisFondosApp:
             legend_entries.append((fund, metrics.period_return(df["Close"], self.period.get())))
             any_data = True
         # La leyenda va en su propia tarjeta junto al resumen de dinero (no dentro de
-        # la gráfica, donde tapaba las líneas).
+        # la gráfica, donde tapaba las líneas), ordenada del más rentable en el periodo
+        # al menos rentable; los que no tienen dato del periodo, al final.
+        legend_entries.sort(key=lambda e: (e[1] is None, -(e[1] or 0)))
         self._render_legend(legend_entries)
         if any_data:
             self.ax.set_title(
