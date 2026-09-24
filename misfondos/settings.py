@@ -1,7 +1,7 @@
 import json
 import os
 
-from . import config
+from . import alerts, config
 
 
 def _load():
@@ -32,6 +32,29 @@ def set_theme(theme_name):
         raise ValueError(f"Tema desconocido: {theme_name}")
     data = _load()
     data["theme"] = theme_name
+    _save(data)
+
+
+def get_alerts():
+    """Reglas de alertas de caída del usuario: {"day": {"on", "pct"}, "week": {...}}."""
+    saved = _load().get("alerts", {})
+    rules = {}
+    for kind, default in alerts.DEFAULTS.items():
+        rule = dict(default)
+        rule.update({k: v for k, v in saved.get(kind, {}).items() if k in ("on", "pct")})
+        if rule["pct"] not in alerts.OPTIONS[kind]:
+            rule["pct"] = default["pct"]
+        rules[kind] = rule
+    return rules
+
+
+def set_alert(kind, on=None, pct=None):
+    data = _load()
+    rule = data.setdefault("alerts", {}).setdefault(kind, {})
+    if on is not None:
+        rule["on"] = bool(on)
+    if pct is not None:
+        rule["pct"] = pct
     _save(data)
 
 

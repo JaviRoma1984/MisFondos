@@ -21,7 +21,7 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
-from . import applog, config, data_fetcher, fund_search, metrics, portfolio, settings, store, system, tray, users
+from . import alerts, applog, config, data_fetcher, fund_search, metrics, portfolio, settings, store, system, tray, users
 
 PERIODS = ["1M", "3M", "6M", "YTD", "1A", "Todo"]
 THEME_ORDER = ["oscuro", "rojo", "claro", "azul", "verde"]
@@ -243,6 +243,28 @@ def _sort_text(text):
 
 def _signed(value, text):
     return ("+" if value > 0 else "") + text
+
+
+def _fmt_pct(pct, decimals=2):
+    """-2.345 -> "−2,35 %" (con el signo menos tipográfico, que se lee mejor)."""
+    sign = "−" if pct < 0 else "+" if pct > 0 else ""
+    return f"{sign}{_fmt_es(abs(pct), decimals)} %"
+
+
+def _alert_notification(new):
+    """(mensaje, título) del aviso de Windows para las alertas recién saltadas."""
+    if len(new) == 1:
+        a = new[0]
+        d = _nav_decimals(a["to_nav"])
+        message = (f"{a['name']}: {_fmt_pct(a['pct'])} {alerts.KIND_TEXT[a['kind']]}\n"
+                   f"Valor liquidativo {_fmt_es(a['from_nav'], d)} → {_fmt_es(a['to_nav'], d)} "
+                   f"({dt.date.fromisoformat(a['to_date']):%d/%m})")
+        return message, "MisFondos · Alerta de caída"
+    lines = []
+    for a in new:
+        name = a["name"] if len(a["name"]) <= 30 else a["name"][:29].rstrip() + "…"
+        lines.append(f"▼ {name}: {_fmt_pct(a['pct'])} {alerts.KIND_TEXT[a['kind']]}")
+    return "\n".join(lines), f"MisFondos · {len(new)} alertas de caída"
 
 
 def _portfolio_totals(funds):
@@ -745,10 +767,10 @@ class ThemeRow(ctk.CTkFrame):
 
 
 class SettingsDialog(ctk.CTkToplevel):
-    """Colores (a la izquierda) e inicio/reloj (a la derecha). Aplica cada tema al
-    elegirlo, pero no se cierra sola: el usuario la cierra con "Cerrar" cuando ya
-    ha decidido la combinación definitiva. En dos columnas para que no salga más
-    alta que la pantalla de un portátil."""
+    """Colores, inicio/reloj y alertas de caídas, en tres columnas (en una sola
+    saldría más alta que la pantalla de un portátil). Aplica cada tema al elegirlo,
+    pero no se cierra sola: el usuario la cierra con "Cerrar" cuando ya ha decidido
+    la combinación definitiva."""
 
     def __init__(self, master, app):
         super().__init__(master)
@@ -819,6 +841,33 @@ class SettingsDialog(ctk.CTkToplevel):
             settings.get_close_to_tray(), self._toggle_close_to_tray,
         )
 
+        # --- tercera columna: alertas de caídas (del usuario activo) ---
+        third = ctk.CTkFrame(body, fg_color="transparent")
+        third.pack(side="left", fill="y", anchor="n", padx=(24, 0))
+        user = users.current()
+        self._section(third, "Alertas de caídas",
+                      _fit_text(self, f"Avisos de Windows para «{user['name']}»" if user else "Avisos de Windows",
+                                FONT_SMALL, OPTION_TEXT_W))
+        card = ctk.CTkFrame(third, fg_color=c["bg_card"], corner_radius=12,
+                            border_width=BORDER_W, border_color=c["border"])
+        card.pack(fill="x", pady=5)
+        rules = settings.get_alerts()
+        self._alert_option(card, alerts.DAY, "Caída en un día", "Último valor frente al anterior. Avisa si baja:",
+                           rules[alerts.DAY])
+        ctk.CTkFrame(card, fg_color=c["border"], height=BORDER_W, corner_radius=0).pack(fill="x", padx=14)
+        self._alert_option(card, alerts.WEEK, "Caída en una semana", "Frente al valor de hace 7 días. Avisa si baja:",
+                           rules[alerts.WEEK])
+        ctk.CTkFrame(card, fg_color=c["border"], height=BORDER_W, corner_radius=0).pack(fill="x", padx=14)
+        footer = ctk.CTkFrame(card, fg_color="transparent")
+        footer.pack(fill="x", padx=14, pady=12)
+        self.test_button = ctk.CTkButton(
+            footer, text="Enviar aviso de prueba", height=34, corner_radius=10, fg_color="transparent",
+            border_width=BORDER_W, border_color=c["border"], text_color=c["text_primary"],
+            hover_color=c["bg_card_hover"], font=FONT_SMALL, command=self._send_test_alert)
+        self.test_button.pack(fill="x")
+        ctk.CTkLabel(footer, text=self._last_alerts_text(), font=FONT_SMALL, text_color=c["text_muted"],
+                     anchor="w", justify="left").pack(fill="x", pady=(10, 0))
+
         ctk.CTkButton(
             self, text="Cerrar", height=38, corner_radius=10, fg_color="transparent",
             border_width=BORDER_W, border_color=c["border"], text_color=c["text_muted"], hover_color=c["bg_card_hover"],
@@ -844,6 +893,53 @@ class SettingsDialog(ctk.CTkToplevel):
         ToggleSwitch(top, c, value, command=on_change, enabled=enabled).pack(side="right")
         ctk.CTkLabel(row, text=description, font=FONT_SMALL, text_color=c["text_muted"], anchor="w",
                      justify="left", wraplength=OPTION_TEXT_W).pack(fill="x", pady=(4, 0))
+
+    def _alert_option(self, parent, kind, title, description, rule):
+        """Regla de alerta: título e interruptor, explicación y umbral a elegir."""
+        c = self.app.colors
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=14, pady=12)
+        top = ctk.CTkFrame(row, fg_color="transparent")
+        top.pack(fill="x")
+        ctk.CTkLabel(top, text=title, font=FONT_BODY, anchor="w", text_color=c["text_primary"]).pack(side="left")
+        ToggleSwitch(top, c, rule["on"], command=lambda sw: self._set_alert(kind, on=sw.get())).pack(side="right")
+        ctk.CTkLabel(row, text=description, font=FONT_SMALL, text_color=c["text_muted"], anchor="w",
+                     justify="left", wraplength=OPTION_TEXT_W).pack(fill="x", pady=(4, 8))
+        pills = PillSwitch(row, c, [f"{p} %" for p in alerts.OPTIONS[kind]],
+                           command=lambda value: self._set_alert(kind, pct=int(value.split()[0])),
+                           height=34, font=FONT_SMALL, radius=10)
+        pills.set(f"{rule['pct']} %")
+        pills.pack(anchor="w")
+
+    @staticmethod
+    def _set_alert(kind, on=None, pct=None):
+        settings.set_alert(kind, on=on, pct=pct)
+        applog.info("Alerta %s: %s", kind, settings.get_alerts()[kind])
+
+    def _last_alerts_text(self):
+        recent = alerts.history()[:3]
+        if not recent:
+            return "Todavía no ha saltado ningún aviso."
+        lines = ["Últimos avisos:"]
+        for a in recent:
+            when = dt.date.fromisoformat(a["to_date"]).strftime("%d/%m")
+            tail = f" {_fmt_pct(a['pct'])} ({'día' if a['kind'] == alerts.DAY else 'semana'})"
+            name = _fit_text(self, a["name"], FONT_SMALL, OPTION_TEXT_W - 130)
+            lines.append(f"{when} · {name}{tail}")
+        return "\n".join(lines)
+
+    def _send_test_alert(self):
+        if not self.app.tray.running:
+            self.test_button.configure(text="Sin icono junto al reloj: no se puede avisar")
+            return
+        self.app.tray.notify(
+            "Así se verán los avisos cuando un fondo baje más de lo que has elegido. "
+            "Si no te ha aparecido, revisa que Windows no tenga activado «No molestar».",
+            "MisFondos · Aviso de prueba")
+        applog.info("Aviso de prueba enviado")
+        self.test_button.configure(text="Aviso enviado ✓")
+        self.after(2500, lambda: self.test_button.winfo_exists() and
+                   self.test_button.configure(text="Enviar aviso de prueba"))
 
     def _toggle_autostart(self, switch):
         try:
@@ -2039,6 +2135,22 @@ class MisFondosApp:
             msg = f"Última actualización: {now}"
         self._ui_queue.put(("status", msg))
         self._ui_queue.put(("redraw", None))
+        self._ui_queue.put(("alerts", None))
+
+    def _check_alerts(self):
+        """Tras cada actualización: avisa (una sola vez) de las caídas que pasen de lo
+        que el usuario activo ha elegido en Configuración → Alertas de caídas."""
+        try:
+            new = alerts.check(store.list_funds(), lambda fid: data_fetcher.load_history(fid)["Close"],
+                               settings.get_alerts())
+        except Exception:
+            applog.log_exception("Fallo comprobando las alertas de caída")
+            return
+        for a in new:
+            applog.info("ALERTA (%s) %s: %.2f %% (VL %s -> %s, del %s)", a["kind"], a["name"], a["pct"],
+                        a["from_nav"], a["to_nav"], a["to_date"])
+        if new:
+            self.tray.notify(*_alert_notification(new))
 
     def _start_scheduler(self):
         def loop():
@@ -2065,6 +2177,9 @@ class MisFondosApp:
                     elif payload == "salir":
                         self._quit()
                         return  # la ventana ya no existe: no se reprograma el sondeo
+                    continue
+                if kind == "alerts":  # no toca la interfaz: nunca se descarta
+                    self._check_alerts()
                     continue
                 if self._rebuilding:
                     continue  # se descarta: la interfaz se está reconstruyendo (cambio de tema)

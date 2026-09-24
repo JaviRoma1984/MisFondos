@@ -18,6 +18,7 @@ FUNDS_FILE = os.path.join(DATA_DIR, "funds.json")
 HISTORY_DIR = os.path.join(DATA_DIR, "history")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 PORTFOLIO_FILE = os.path.join(DATA_DIR, "portfolio.json")
+ALERTS_FILE = os.path.join(DATA_DIR, "alerts.json")  # users.py lo apunta a la carpeta del usuario
 
 # Los fondos publican un valor liquidativo al día, a una hora que varía según la
 # gestora; comprobar cada 15 min hace que el dato nuevo aparezca poco después de

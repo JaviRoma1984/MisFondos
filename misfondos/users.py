@@ -4,7 +4,8 @@ Estructura en disco (junto al .exe):
     data/users.json                 lista de usuarios y el usuario activo
     data/users/<id>/funds.json      fondos de ese usuario
     data/users/<id>/portfolio.json  sus aportaciones y reembolsos
-    data/users/<id>/settings.json   sus ajustes (tema de colores)
+    data/users/<id>/settings.json   sus ajustes (tema de colores, reglas de alertas)
+    data/users/<id>/alerts.json     alertas ya avisadas y los últimos avisos
     data/history/<ISIN>.csv         histórico de VL, COMÚN a todos: el precio de un
                                     fondo es el mismo sea quien sea quien lo siga
 
@@ -54,6 +55,7 @@ def _point_config_to(user_id):
     config.FUNDS_FILE = os.path.join(folder, "funds.json")
     config.PORTFOLIO_FILE = os.path.join(folder, "portfolio.json")
     config.SETTINGS_FILE = os.path.join(folder, "settings.json")
+    config.ALERTS_FILE = os.path.join(folder, "alerts.json")
 
 
 def init():

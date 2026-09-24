@@ -67,6 +67,12 @@ class TrayIcon:
     def notify(self, message, title="MisFondos"):
         if not self._icon:
             return
+        # Límites de Windows para los avisos del área de notificación
+        # (szInfo[256], szInfoTitle[64]); pasarse lanza error en vez de recortar.
+        if len(message) > 255:
+            message = message[:254] + "…"
+        if len(title) > 63:
+            title = title[:62] + "…"
         try:
             self._icon.notify(message, title)
         except Exception:
