@@ -1,0 +1,11 @@
+# Entorno y compilación
+venv/
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# Datos personales (fondos, aportaciones, usuarios, ajustes, histórico y log):
+# se crean junto al programa al usarlo y nunca se suben.
+data/
