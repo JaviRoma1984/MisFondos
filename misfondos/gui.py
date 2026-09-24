@@ -101,7 +101,8 @@ def _position_over_parent(win, master, width, height):
 
 # La vista "individual" (un fondo, el elegido en la lista) no tiene pestaña aquí:
 # es el botón 1 de "Ver juntas".
-VIEW_LABELS = {"global": "Vista global", "reparto": "Reparto", "rentabilidades": "Rentabilidades"}
+VIEW_LABELS = {"global": "Vista global", "reparto": "Reparto", "rentabilidades": "Rentabilidades",
+               "riesgo": "Riesgo"}
 # Vistas que no son una gráfica temporal: sin selector de periodos ni indicador.
 SNAPSHOT_VIEWS = ("reparto", "rentabilidades")
 # "Ver juntas": botones en la barra de periodos, a continuación de los meses/años.
@@ -119,6 +120,39 @@ RETURN_COLUMNS = [
     ("3A", "3A anual.", 76),
     ("mine", "Mi rentabilidad", 100),
 ]
+
+# Columnas de la tabla de riesgo: (clave, cabecera, ancho lógico, explicación del
+# bocadillo de la cabecera, en palabras de andar por casa).
+RISK_COLUMNS = [
+    ("volatility", "Volatilidad", 80,
+     "Cuánto sube y baja el fondo, en % al año (desviación típica de sus\n"
+     "variaciones diarias, anualizada). Más alta = más vaivenes, hacia arriba\n"
+     "y hacia abajo. De referencia: un monetario, menos de 0,5 %; la bolsa\n"
+     "mundial, alrededor de un 15 %."),
+    ("level", "Nivel", 100,
+     "Nivel de riesgo del 1 (muy bajo) al 7 (muy alto) según la volatilidad,\n"
+     "con los mismos tramos que la escala de los folletos de los fondos (SRRI).\n"
+     "Es orientativo: el oficial se calcula con 5 años de datos semanales."),
+    ("max_drawdown", "Máx. caída", 82,
+     "La peor bajada del periodo, desde un máximo hasta el mínimo que vino\n"
+     "después: lo que habrías llegado a perder entrando en el peor momento."),
+    ("recovery", "Recuperó en", 88,
+     "Tiempo que tardó, desde el máximo de antes de esa peor caída, en volver\n"
+     "a alcanzarlo. «Aún no» = sigue por debajo de aquel máximo."),
+    ("from_max", "Desde máx.", 84,
+     "Cuánto está ahora por debajo del valor más alto del periodo.\n"
+     "«En máximos» = está en su valor más alto."),
+    ("worst_day", "Peor día", 72, "La mayor bajada en un solo día dentro del periodo."),
+]
+# Sentido del primer clic en cada columna para que salga primero el de MENOS
+# riesgo (True = de mayor a menor: p. ej. −2 % antes que −20 %).
+RISK_LOW_FIRST_DESC = {"volatility": False, "level": False, "max_drawdown": True, "recovery": False,
+                       "from_max": True, "worst_day": True}
+# Por debajo de esto (en %) una caída es ruido de redondeo: se muestra como 0.
+RISK_ZERO = 0.005
+# Círculos de la escala de riesgo (px lógicos).
+LEVEL_DOT = 8
+LEVEL_DOT_GAP = 2
 
 PERIOD_PHRASES = {
     "1M": "En 1 mes", "3M": "En 3 meses", "6M": "En 6 meses",
@@ -250,6 +284,44 @@ def _sort_text(text):
 
 def _signed(value, text):
     return ("+" if value > 0 else "") + text
+
+
+_LEVEL_IMAGES = {}
+
+
+def _level_image(level, color, empty_color, scale):
+    """Escala de riesgo como 7 círculos iguales: los `level` primeros rellenos y el
+    resto solo con borde. Con los caracteres ● y ○ no sale: en Segoe UI el relleno
+    es bastante más pequeño que el vacío."""
+    key = (level, color, empty_color, scale)
+    if key not in _LEVEL_IMAGES:
+        d, gap, s = LEVEL_DOT, LEVEL_DOT_GAP, 4  # tamaños lógicos; se dibuja a 4x y se reduce
+        w, h = 7 * d + 6 * gap, d
+        pw, ph = round(w * scale), round(h * scale)
+        img = Image.new("RGBA", (pw * s, ph * s), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        fill = ImageColor.getrgb(color)[:3] + (255,)
+        empty = ImageColor.getrgb(empty_color)[:3] + (255,)
+        edge = max(1, round(1.2 * scale * s))
+        for i in range(7):
+            x0 = round(i * (d + gap) * scale * s)
+            box = [x0 + edge // 2, edge // 2, x0 + round(d * scale * s) - 1 - edge // 2, ph * s - 1 - edge // 2]
+            if i < level:
+                draw.ellipse(box, fill=fill)
+            else:
+                draw.ellipse(box, outline=empty, width=edge)
+        img = img.resize((pw, ph), Image.LANCZOS)
+        _LEVEL_IMAGES[key] = ctk.CTkImage(light_image=img, dark_image=img, size=(w, h))
+    return _LEVEL_IMAGES[key]
+
+
+def _fmt_duration(days):
+    """Días en palabras: "12 días", "4 meses", "2,7 años"."""
+    if days < 60:
+        return "1 día" if days == 1 else f"{days} días"
+    if days < 730:
+        return f"{round(days / 30.44)} meses"
+    return f"{_fmt_es(days / 365.25, 1)} años"
 
 
 def _fmt_pct(pct, decimals=2):
@@ -1471,6 +1543,7 @@ class MisFondosApp:
         self._ui_queue = queue.Queue()
         self._rebuilding = False
         self._table_sort = (None, True)  # (columna, descendente); None = orden de la lista
+        self._risk_sort = (None, True)   # lo mismo para la tabla de riesgo
         self._last_refresh = None
 
         # Icono junto al reloj: se crea antes del primer dibujado para que este ya
@@ -1760,6 +1833,7 @@ class MisFondosApp:
         chart_card.pack(fill="both", expand=True, padx=24, pady=(14, 20))
         self.chart_card = chart_card
         self._build_returns_table(main)
+        self._build_risk_table(main)
 
         self.fig = Figure(figsize=(7, 5), dpi=100, facecolor=c["bg_card"])
         self.ax = self.fig.add_subplot(111)
@@ -1985,33 +2059,184 @@ class MisFondosApp:
                              font=("Segoe UI Semibold", 12) if bold else FONT_BODY).pack(
                     side="right", padx=(4, 12 if j == 0 else 0), pady=8)
             fund = r["fund"]
-            cell = ctk.CTkFrame(line, fg_color="transparent")
-            cell.pack(side="left", fill="x", expand=True, padx=(10, 0), pady=6)
-            dot = ctk.CTkLabel(cell, text="●", text_color=fund["color"], font=("Segoe UI", 14), width=18)
-            dot.pack(side="left", anchor="n", pady=(2, 0))
-            texts = ctk.CTkFrame(cell, fg_color="transparent")
-            texts.pack(side="left", fill="x", expand=True, padx=(4, 0))
-            label = ctk.CTkLabel(texts, text=fund["name"], text_color=c["text_primary"], font=FONT_BODY, anchor="w",
-                                 cursor="hand2", height=20)
-            label.pack(anchor="w")
             sub = "—"
             if r["nav"] is not None:
                 symbol = _CURRENCY_SYMBOLS.get((fund.get("currency") or "").upper(), fund.get("currency", ""))
                 sub = f"VL {_fmt_es(r['nav'], _nav_decimals(r['nav']))} {symbol} · {r['nav_date']:%d/%m/%Y}"
-            sub_label = ctk.CTkLabel(texts, text=sub, text_color=c["text_muted"], font=FONT_SMALL, anchor="w",
-                                     height=16)
-            sub_label.pack(anchor="w")
+            self._table_name_cell(line, fund, sub)
 
-            # Nombre y VL se recortan con "…" al ancho que quede libre para la celda
-            # (depende del tamaño de la ventana), en vez de cortarse a mitad de letra.
-            def fit(event, full=fund["name"], sub_full=sub, lbl=label, sub_lbl=sub_label, cell=cell):
-                avail = event.width / ctk.ScalingTracker.get_widget_scaling(cell) - 30
-                lbl.configure(text=_fit_text(cell, full, FONT_BODY, avail))
-                sub_lbl.configure(text=_fit_text(cell, sub_full, FONT_SMALL, avail))
-            cell.bind("<Configure>", fit)
-            # <ButtonRelease-1>: la regla de la app para bind manuales (ver FundRow).
-            for w in (dot, label):
-                w.bind("<ButtonRelease-1>", lambda _e, fid=fund["id"]: self._open_fund_from_table(fid))
+    def _table_name_cell(self, line, fund, sub):
+        """Celda del nombre en las tablas: punto de color, nombre (clic = su gráfica)
+        y una línea gris debajo."""
+        c = self.colors
+        cell = ctk.CTkFrame(line, fg_color="transparent")
+        cell.pack(side="left", fill="x", expand=True, padx=(10, 0), pady=6)
+        dot = ctk.CTkLabel(cell, text="●", text_color=fund["color"], font=("Segoe UI", 14), width=18)
+        dot.pack(side="left", anchor="n", pady=(2, 0))
+        texts = ctk.CTkFrame(cell, fg_color="transparent")
+        texts.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        label = ctk.CTkLabel(texts, text=fund["name"], text_color=c["text_primary"], font=FONT_BODY, anchor="w",
+                             cursor="hand2", height=20)
+        label.pack(anchor="w")
+        sub_label = ctk.CTkLabel(texts, text=sub, text_color=c["text_muted"], font=FONT_SMALL, anchor="w",
+                                 height=16)
+        sub_label.pack(anchor="w")
+
+        # Nombre y línea de abajo se recortan con "…" al ancho que quede libre para la
+        # celda (depende del tamaño de la ventana), en vez de cortarse a mitad de letra.
+        def fit(event, full=fund["name"], sub_full=sub, lbl=label, sub_lbl=sub_label, cell=cell):
+            avail = event.width / ctk.ScalingTracker.get_widget_scaling(cell) - 30
+            lbl.configure(text=_fit_text(cell, full, FONT_BODY, avail))
+            sub_lbl.configure(text=_fit_text(cell, sub_full, FONT_SMALL, avail))
+        cell.bind("<Configure>", fit)
+        # <ButtonRelease-1>: la regla de la app para bind manuales (ver FundRow).
+        for w in (dot, label):
+            w.bind("<ButtonRelease-1>", lambda _e, fid=fund["id"]: self._open_fund_from_table(fid))
+
+    # ---------- tabla de riesgo ----------
+    def _build_risk_table(self, parent):
+        """Misma estructura que la de rentabilidades; cada cabecera explica en un
+        bocadillo qué significa su métrica."""
+        c = self.colors
+        card = ctk.CTkFrame(parent, fg_color=c["bg_card"], corner_radius=16, border_width=BORDER_W, border_color=c["border"])
+        self.risk_card = card  # se empaqueta/oculta en _update_header según la vista
+        self._risk_title = ctk.CTkLabel(card, text="Riesgo", font=("Segoe UI Semibold", 15), text_color=c["text_primary"])
+        self._risk_title.pack(anchor="w", padx=24, pady=(18, 6))
+
+        scroll = ctk.CTkScrollableFrame(card, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=14)
+        header = ctk.CTkFrame(scroll, fg_color="transparent")
+        header.pack(fill="x", pady=(0, 4))
+        self._risk_headers = {}
+        for i, (key, title, width, help_text) in enumerate(reversed(RISK_COLUMNS)):
+            lbl = ctk.CTkLabel(header, text=title, width=width, anchor="e", text_color=c["text_muted"],
+                               font=FONT_SMALL, cursor="hand2")
+            lbl.pack(side="right", padx=(4, 12 if i == 0 else 0), pady=4)
+            lbl.bind("<ButtonRelease-1>", lambda _e, k=key: self._sort_risk(k))
+            Tooltip(lbl, help_text, c)
+            self._risk_headers[key] = (lbl, title)
+        name_lbl = ctk.CTkLabel(header, text="Fondo", anchor="w", text_color=c["text_muted"], font=FONT_SMALL,
+                                cursor="hand2")
+        name_lbl.pack(side="left", padx=(12, 0), pady=4)
+        name_lbl.bind("<ButtonRelease-1>", lambda _e: self._sort_risk("name"))
+        self._risk_headers["name"] = (name_lbl, "Fondo")
+        self._risk_rows = ctk.CTkFrame(scroll, fg_color="transparent")
+        self._risk_rows.pack(fill="x")
+
+        note = ctk.CTkLabel(
+            card, font=FONT_SMALL, text_color=c["text_muted"], justify="left", anchor="w",
+            text="Calculado con los valores liquidativos diarios del periodo elegido arriba. Pasa el ratón por "
+                 "una cabecera para ver qué significa, púlsala para ordenar (primero, el de menos riesgo) y pulsa "
+                 "el nombre de un fondo para ver su gráfica. En negrita, el de menos riesgo de cada columna.",
+        )
+        note.pack(fill="x", padx=24, pady=(8, 16))
+        card.bind("<Configure>", lambda e: note.configure(
+            wraplength=max(200, e.width / ctk.ScalingTracker.get_widget_scaling(card) - 60)))
+
+    def _sort_risk(self, key):
+        current, desc = self._risk_sort
+        # Primer clic: del de menos riesgo al de más; en "Fondo", A→Z.
+        first = RISK_LOW_FIRST_DESC.get(key, False)
+        desc = (not desc) if key == current else first
+        self._risk_sort = (key, desc)
+        self._render_risk_table(store.list_funds())
+
+    @staticmethod
+    def _risk_sort_value(r, key):
+        """Valor para ordenar (None = sin dato, siempre al final)."""
+        m = r["risk"]
+        if m is None:
+            return None
+        if key == "recovery":
+            if m["max_drawdown"] > -RISK_ZERO:
+                return 0  # sin caídas: lo mejor
+            return m["recovery_days"] if m["recovery_days"] is not None else float("inf")
+        return m[key]
+
+    def _render_risk_table(self, funds):
+        c = self.colors
+        period = self.period.get()
+        self._risk_title.configure(text=f"Riesgo · {PERIOD_PHRASES.get(period, period).lower()}")
+        for w in self._risk_rows.winfo_children():
+            w.destroy()
+        rows = []
+        for f in funds:
+            closes = data_fetcher.load_history(f["id"])["Close"].dropna()
+            rows.append({"fund": f, "risk": metrics.risk(closes, period)})
+        if not rows:
+            ctk.CTkLabel(self._risk_rows, text="Añade fondos para ver su riesgo.",
+                         font=FONT_BODY, text_color=c["text_muted"]).pack(anchor="w", padx=10, pady=12)
+            return
+
+        key, desc = self._risk_sort
+        if key == "name":
+            rows.sort(key=lambda r: _sort_text(r["fund"]["name"]), reverse=desc)
+        elif key:
+            with_value = sorted((r for r in rows if self._risk_sort_value(r, key) is not None),
+                                key=lambda r: self._risk_sort_value(r, key), reverse=desc)
+            rows = with_value + [r for r in rows if self._risk_sort_value(r, key) is None]
+        for k, (lbl, title) in self._risk_headers.items():
+            arrow = (" ▼" if desc else " ▲") if k == key else ""
+            lbl.configure(text=title + arrow, text_color=c["text_primary"] if k == key else c["text_muted"])
+
+        # El de menos riesgo de cada columna, en negrita (con al menos 2 fondos).
+        best = {}
+        for k, _t, _w, _h in RISK_COLUMNS:
+            values = [self._risk_sort_value(r, k) for r in rows if self._risk_sort_value(r, k) is not None]
+            if len(values) >= 2:
+                best[k] = max(values) if RISK_LOW_FIRST_DESC[k] else min(values)
+
+        for i, r in enumerate(rows):
+            line = ctk.CTkFrame(self._risk_rows, fg_color=c["bg_card_hover"] if i % 2 == 0 else "transparent",
+                                corner_radius=8)
+            line.pack(fill="x", pady=2)
+            m = r["risk"]
+            for j, (key_, _title, width, _help) in enumerate(reversed(RISK_COLUMNS)):
+                text, color = self._risk_cell(m, key_)
+                bold = key_ in best and self._risk_sort_value(r, key_) == best[key_]
+                extra = {}
+                if key_ == "level" and m is not None:
+                    # Escala de 7 círculos y, a su derecha, el número.
+                    extra = {"image": _level_image(m["level"], color, c["text_muted"],
+                                                   ctk.ScalingTracker.get_widget_scaling(line)),
+                             "compound": "left"}
+                    text = f" {text}"
+                ctk.CTkLabel(line, text=text, width=width, anchor="e", text_color=color,
+                             font=("Segoe UI Semibold", 12) if bold else FONT_BODY, **extra).pack(
+                    side="right", padx=(4, 12 if j == 0 else 0), pady=8)
+            if m is None:
+                sub = "Sin datos suficientes para este periodo"
+            elif m["max_drawdown"] > -RISK_ZERO:
+                sub = "Sin caídas en el periodo"
+            else:
+                sub = f"Peor caída: del {m['peak_date']:%d/%m/%Y} al {m['trough_date']:%d/%m/%Y}"
+            self._table_name_cell(line, r["fund"], sub)
+
+    def _risk_cell(self, m, key):
+        """(texto, color) de una celda de la tabla de riesgo."""
+        c = self.colors
+        if m is None:
+            return "—", c["text_muted"]
+        if key == "volatility":
+            return f"{_fmt_es(m['volatility'], 2)} %", c["text_primary"]
+        if key == "level":
+            n = m["level"]
+            color = c["up"] if n <= 2 else (c["warning"] if n <= 4 else c["down"])
+            return str(n), color  # la escala de círculos la añade _render_risk_table
+        if key == "max_drawdown":
+            v = m["max_drawdown"]
+            return ("0,00 %", c["text_primary"]) if v > -RISK_ZERO else (_fmt_pct(v), c["down"])
+        if key == "recovery":
+            if m["max_drawdown"] > -RISK_ZERO:
+                return "—", c["text_muted"]
+            if m["recovery_days"] is None:
+                return "Aún no", c["down"]
+            return _fmt_duration(m["recovery_days"]), c["text_primary"]
+        if key == "from_max":
+            v = m["from_max"]
+            return ("En máximos", c["up"]) if v > -RISK_ZERO else (_fmt_pct(v), c["down"])
+        v = m["worst_day"]
+        return ("0,00 %", c["text_primary"]) if v > -RISK_ZERO else (_fmt_pct(v), c["down"])
 
     # ---------- indicador de subida/bajada ----------
     def _build_change_indicator(self, parent):
@@ -2064,14 +2289,14 @@ class MisFondosApp:
                 self.period_switch.pack_forget()
             elif not self.period_switch.winfo_manager():
                 self.period_switch.pack(side="left", before=self.multi_group)
-            # La tabla sustituye a la gráfica (se ocultan, nunca se destruyen).
-            if mode == "rentabilidades":
-                self.chart_card.pack_forget()
-                self.table_card.pack(fill="both", expand=True, padx=24, pady=(14, 20))
-            else:
-                self.table_card.pack_forget()
-                if not self.chart_card.winfo_manager():
-                    self.chart_card.pack(fill="both", expand=True, padx=24, pady=(14, 20))
+            # Las tablas sustituyen a la gráfica (se ocultan, nunca se destruyen). La de
+            # riesgo sí usa el periodo elegido, así que en ella la barra de meses se queda.
+            shown = {"rentabilidades": self.table_card, "riesgo": self.risk_card}.get(mode, self.chart_card)
+            for card in (self.chart_card, self.table_card, self.risk_card):
+                if card is not shown:
+                    card.pack_forget()
+            if not shown.winfo_manager():
+                shown.pack(fill="both", expand=True, padx=24, pady=(14, 20))
             self._header_mode = mode
         if mode == "multi":
             self.multi_note.configure(text=self._multi_note_text())
@@ -2354,6 +2579,8 @@ class MisFondosApp:
                     self._draw_global(funds)
                 elif mode == "reparto":
                     self._draw_allocation(funds)
+                elif mode == "riesgo":
+                    self._render_risk_table(funds)
                 else:
                     self._render_returns_table(funds)
                 self._hover_dot, self._hover_ann, self._hover_vline = self._make_hover_artists(self.ax)
