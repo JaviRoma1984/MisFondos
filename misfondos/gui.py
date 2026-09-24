@@ -2314,6 +2314,7 @@ class MisFondosApp:
             "", xy=(0, 0), xytext=(14, 14), textcoords="offset points",
             bbox=dict(boxstyle="round,pad=0.5", fc=c["bg_card_hover"], ec=c["border"], lw=1),
             color=c["text_primary"], fontsize=9, visible=False, zorder=6,
+            multialignment="left",  # renglones a la izquierda aunque salga a la izquierda del punto
         )
         # Raya de arriba a abajo de la gráfica: X en fechas, Y de 0 a 1 del recuadro.
         # Con add_artist (y no axvline) no cuenta para los límites del eje: axvline
@@ -2436,33 +2437,47 @@ class MisFondosApp:
         if self._hover_ann is not None and self.view_mode.get() == "reparto":
             self._hover_pie(event)
             return
-        if not self._plot_series or self._hover_ann is None or event.inaxes != self.ax or event.xdata is None:
+        if (not self._plot_series or self._hover_ann is None or event.inaxes != self.ax
+                or event.xdata is None or event.ydata is None):
             self._hide_hover()
             return
 
+        # Para cada línea, su punto en la fecha más cercana al puntero; se marca la
+        # línea cuyo punto queda más cerca del puntero en pantalla (en la vista global
+        # hay varias superpuestas: la que tengas debajo del ratón, no siempre la primera).
         x_cursor = event.xdata
-        lines = []
-        ref_num = None
-        dot_x = dot_y = dot_color = None
+        to_px = self.ax.transData.transform
+        cursor_px = to_px((x_cursor, event.ydata))
+        points = []
         for series in self._plot_series:
             xnum = series["xnum"]
             if len(xnum) == 0:
                 continue
             idx = (abs(xnum - x_cursor)).argmin()
-            value = series["values"][idx]
-            if ref_num is None:
-                ref_num = xnum[idx]
-                dot_x, dot_y, dot_color = xnum[idx], value, series["color"]
-            normalized = self.view_mode.get() == "global" and self.normalize_var.get()
-            lines.append(f"{series['label']}: {_fmt_es(value, 2 if normalized else _nav_decimals(value))}")
-
-        if ref_num is None:
+            x, y = xnum[idx], series["values"][idx]
+            px = to_px((x, y))
+            points.append({"series": series, "x": x, "y": y,
+                           "dist": ((px[0] - cursor_px[0]) ** 2 + (px[1] - cursor_px[1]) ** 2) ** 0.5})
+        if not points:
             self._hide_hover()
             return
+        chosen = min(points, key=lambda p: p["dist"])
 
-        header = mdates.num2date(ref_num).strftime("%d %b %Y")
-        self._place_hover(self.ax, self._hover_ann, self._hover_dot, self._hover_vline, dot_x, dot_y, dot_color,
-                          header + "\n" + "\n".join(lines), x_cursor)
+        normalized = self.view_mode.get() == "global" and self.normalize_var.get()
+
+        def line(p):
+            v = p["y"]
+            return f"{p['series']['label']}: {_fmt_es(v, 2 if normalized else _nav_decimals(v))}"
+
+        header = mdates.num2date(chosen["x"]).strftime("%d %b %Y")
+        several = len(points) > 1
+        # La marcada, la primera y con ●; debajo, el resto en esa misma fecha para comparar.
+        lines = [("● " if several else "") + line(chosen)] + [line(p) for p in points if p is not chosen]
+        box = self._hover_ann.get_bbox_patch()  # borde del bocadillo del color de la marcada
+        box.set_edgecolor(chosen["series"]["color"] if several else self.colors["border"])
+        box.set_linewidth(1.6 if several else 1)
+        self._place_hover(self.ax, self._hover_ann, self._hover_dot, self._hover_vline, chosen["x"], chosen["y"],
+                          chosen["series"]["color"], header + "\n" + "\n".join(lines), x_cursor)
         self.canvas.draw_idle()
 
     def _hover_multi(self, event):
