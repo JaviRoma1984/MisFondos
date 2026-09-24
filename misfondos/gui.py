@@ -150,6 +150,11 @@ RISK_LOW_FIRST_DESC = {"volatility": False, "level": False, "max_drawdown": True
                        "from_max": True, "worst_day": True}
 # Por debajo de esto (en %) una caída es ruido de redondeo: se muestra como 0.
 RISK_ZERO = 0.005
+# Leyenda de la vista global: alto de cada fondo y cuántos se ven sin desplazar.
+LEGEND_ROW_H = 22
+LEGEND_MAX_ROWS = 3
+# Ancho máximo del texto bajo las cifras del resumen en la vista global.
+PF_HINT_WRAP_GLOBAL = 460
 # Círculos de la escala de riesgo (px lógicos).
 LEVEL_DOT = 8
 LEVEL_DOT_GAP = 2
@@ -1857,10 +1862,17 @@ class MisFondosApp:
         """Resumen de dinero invertido. Como el indicador, se crea una vez y solo se
         actualiza con configure(): nunca se destruye desde un redibujado."""
         c = self.colors
-        card = ctk.CTkFrame(parent, fg_color=c["bg_card"], corner_radius=12, border_width=BORDER_W, border_color=c["border"])
-        card.pack(fill="x", padx=24, pady=(14, 0))
+        # Fila con dos tarjetas: el resumen de dinero y, solo en la vista global, la
+        # leyenda de la gráfica a su derecha (ver _layout_strip).
+        self.pf_row = ctk.CTkFrame(parent, fg_color="transparent")
+        self.pf_row.pack(fill="x", padx=24, pady=(14, 0))
+        card = ctk.CTkFrame(self.pf_row, fg_color=c["bg_card"], corner_radius=12, border_width=BORDER_W,
+                            border_color=c["border"])
+        card.pack(side="left", fill="x", expand=True)
+        self.pf_card = card
         row = ctk.CTkFrame(card, fg_color="transparent")
         row.pack(fill="x", padx=16, pady=(10, 0))
+        self._pf_values_row = row
 
         self.pf_values = {}
         for key, caption in (("invested", "Invertido"), ("value", "Valor actual"),
@@ -1881,6 +1893,129 @@ class MisFondosApp:
 
         self.pf_hint = ctk.CTkLabel(card, text="", font=FONT_SMALL, text_color=c["text_muted"], anchor="w", justify="left")
         self.pf_hint.pack(fill="x", padx=16, pady=(2, 10))
+        self._build_legend_card()
+        self._strip_global = False
+
+    # ---------- leyenda de la vista global ----------
+    def _build_legend_card(self):
+        """Leyenda de la vista global en su propia tarjeta, al lado del resumen de
+        dinero, en vez de dentro de la gráfica (tapaba parte de las líneas). Los
+        fondos se apilan uno debajo de otro; si no caben, sale una barra de
+        desplazamiento a la derecha (y solo entonces)."""
+        c = self.colors
+        card = ctk.CTkFrame(self.pf_row, fg_color=c["bg_card"], corner_radius=12, border_width=BORDER_W,
+                            border_color=c["border"])
+        self.legend_card = card  # se empaqueta/oculta en _layout_strip
+        self.legend_caption = ctk.CTkLabel(card, text="", font=FONT_SMALL, text_color=c["text_muted"], anchor="w")
+        self.legend_caption.pack(fill="x", padx=16, pady=(8, 0))
+        self.legend_scroll = ctk.CTkScrollableFrame(card, fg_color="transparent", height=LEGEND_ROW_H,
+                                                    corner_radius=0)
+        self.legend_scroll.pack(fill="both", expand=True, padx=(8, 6), pady=(0, 6))
+        # La barra vertical de CustomTkinter pide 200 px de alto: al aparecer estiraba
+        # la tarjeta, entonces ya cabía todo y se ocultaba, la tarjeta encogía, volvía
+        # a hacer falta... (bucle que dejaba la gráfica sin alto). Con el alto de una
+        # fila, mostrarla u ocultarla solo cambia el ancho, nunca el alto.
+        self.legend_scroll._scrollbar.configure(height=LEGEND_ROW_H)
+        # Colores con los que se ve la barra; sin fondos ocultos se pinta del color de
+        # la tarjeta (ver _update_legend_scrollbar).
+        bar = self.legend_scroll._scrollbar
+        self._legend_bar_colors = (bar.cget("button_color"), bar.cget("button_hover_color"))
+        self._legend_bar_visible = True
+        # Cuando cambia el alto visible o el del contenido, se revisa si hace falta la
+        # barra (add="+": CustomTkinter usa esos mismos eventos para su zona desplazable).
+        self.legend_scroll._parent_canvas.bind("<Configure>", lambda _e: self._schedule_legend_scrollbar(), add="+")
+        self.legend_scroll.bind("<Configure>", lambda _e: self._schedule_legend_scrollbar(), add="+")
+
+    def _layout_strip(self, global_mode):
+        """Vista global: resumen ajustado a su contenido y leyenda en el hueco que
+        queda a la derecha. Resto de vistas: el resumen a todo el ancho, como antes."""
+        if global_mode == self._strip_global:
+            return
+        self._strip_global = global_mode
+        self.pf_card.pack_forget()
+        self.legend_card.pack_forget()
+        if global_mode:
+            self.pf_card.pack(side="left", fill="y")
+            self.legend_card.pack(side="left", fill="both", expand=True, padx=(14, 0))
+            # El texto de abajo no debe ensanchar la tarjeta más que las cifras.
+            self.pf_hint.configure(wraplength=PF_HINT_WRAP_GLOBAL)
+        else:
+            self.pf_card.pack(side="left", fill="x", expand=True)
+            self.pf_hint.configure(wraplength=0)
+
+    def _render_legend(self, entries):
+        """entries: [(fondo, rentabilidad en el periodo o None)] en el orden de la gráfica."""
+        c = self.colors
+        self.legend_caption.configure(
+            text=f"Fondos de la gráfica · rentabilidad {PERIOD_PHRASES.get(self.period.get(), '').lower()}")
+        for w in self.legend_scroll.winfo_children():
+            w.destroy()
+        if not entries:
+            ctk.CTkLabel(self.legend_scroll, text="Sin datos todavía", font=FONT_SMALL,
+                         text_color=c["text_muted"]).pack(anchor="w", padx=8)
+        for fund, ret in entries:
+            line = ctk.CTkFrame(self.legend_scroll, fg_color="transparent", height=LEGEND_ROW_H)
+            line.pack(fill="x", padx=(0, 4))
+            line.pack_propagate(False)
+            # Una rayita del color de su línea, como en una leyenda de gráfica.
+            swatch = ctk.CTkFrame(line, fg_color=fund["color"], width=18, height=4, corner_radius=2)
+            swatch.pack(side="left", padx=(8, 10))
+            if ret is not None:
+                color = c["up"] if ret > 0 else (c["down"] if ret < 0 else c["text_primary"])
+                ctk.CTkLabel(line, text=_signed(ret, f"{_fmt_es(ret, 2)} %"), font=FONT_SMALL, text_color=color,
+                             anchor="e", width=64).pack(side="right", padx=(8, 4))
+            # El nombre va dentro de un hueco que ocupa lo que sobra de la fila, y se
+            # recorta con "…" al ancho de ESE hueco (no al de la etiqueta: al recortar
+            # el texto la etiqueta encoge y se quedaría para siempre en "…").
+            cell = ctk.CTkFrame(line, fg_color="transparent", height=LEGEND_ROW_H)
+            cell.pack(side="left", fill="both", expand=True)
+            name = ctk.CTkLabel(cell, text=fund["name"], font=FONT_SMALL, text_color=c["text_primary"],
+                                anchor="w", cursor="hand2")
+            name.place(relx=0, rely=0.5, anchor="w")
+            cell.bind("<Configure>", lambda e, full=fund["name"], lbl=name, cell=cell: lbl.configure(
+                text=_fit_text(cell, full, FONT_SMALL, e.width / ctk.ScalingTracker.get_widget_scaling(cell) - 4)))
+            Tooltip(name, f"{fund['name']}\nPulsa para ver su gráfica", c)
+            cell.configure(cursor="hand2")
+            for w in (swatch, cell, name):
+                w.bind("<ButtonRelease-1>", lambda _e, fid=fund["id"]: self._open_fund_from_table(fid))
+        # Alto: hasta LEGEND_MAX_ROWS fondos a la vista; con más, desplazamiento.
+        rows = max(1, min(len(entries), LEGEND_MAX_ROWS))
+        self.legend_scroll.configure(height=rows * LEGEND_ROW_H + 4)  # +4: holgura, un ajuste justo no es "no cabe"
+        self.legend_scroll._parent_canvas.yview_moveto(0)
+        self._schedule_legend_scrollbar()
+
+    def _schedule_legend_scrollbar(self):
+        if getattr(self, "_legend_sb_after", None) is None:
+            self._legend_sb_after = self.root.after_idle(self._update_legend_scrollbar)
+
+    def _update_legend_scrollbar(self):
+        """La barra de desplazamiento solo se ve si hay fondos que no caben.
+
+        No se quita de la rejilla (grid_remove): en la app seguía pintada encima del
+        borde derecho de la lista aunque ya no estuviera en la rejilla, tapando los
+        porcentajes. Se queda siempre en su sitio (así nada cambia de tamaño al
+        aparecer o desaparecer) y, cuando sobra, se pinta del color de la tarjeta."""
+        self._legend_sb_after = None
+        try:
+            canvas = self.legend_scroll._parent_canvas
+            bar = self.legend_scroll._scrollbar
+            if not canvas.winfo_ismapped():
+                return  # vista sin leyenda: se revisará al mostrarse (evento <Configure>)
+            # Alto pedido por las filas frente al alto visible (no yview(): antes de que
+            # la tarjeta termine de colocarse puede decir que no cabe cuando sí cabe).
+            needed = self.legend_scroll.winfo_reqheight() > canvas.winfo_height() + 2
+            if needed != self._legend_bar_visible:
+                if needed:
+                    bar.configure(button_color=self._legend_bar_colors[0],
+                                  button_hover_color=self._legend_bar_colors[1])
+                else:
+                    bg = self.colors["bg_card"]
+                    bar.configure(button_color=bg, button_hover_color=bg)
+                self._legend_bar_visible = needed
+            if not needed:
+                canvas.yview_moveto(0)
+        except tk.TclError:
+            pass  # la tarjeta se ha destruido (cambio de tema) antes de llegar aquí
 
     def _open_portfolio_dialog(self):
         fund = next((f for f in store.list_funds() if f["id"] == self.selected_fund_id), None)
@@ -1901,6 +2036,7 @@ class MisFondosApp:
 
     def _update_portfolio_strip(self):
         funds = store.list_funds()
+        self._layout_strip(self.view_mode.get() == "global")
         if self.view_mode.get() == "individual":
             if not self.pf_button.winfo_manager():
                 self.pf_button.pack(side="right")
@@ -2856,6 +2992,7 @@ class MisFondosApp:
             self.ax.text(0.5, 0.5, "Añade fondos para ver la vista global", color=c["text_muted"], ha="center", va="center")
             return
         any_data = False
+        legend_entries = []
         for fund in funds:
             df = data_fetcher.load_history(fund["id"])
             if df.empty:
@@ -2872,13 +3009,12 @@ class MisFondosApp:
                 "label": fund["name"], "color": fund["color"],
                 "xnum": mdates.date2num(view.index.to_pydatetime()), "values": series.to_numpy(),
             })
+            legend_entries.append((fund, metrics.period_return(df["Close"], self.period.get())))
             any_data = True
+        # La leyenda va en su propia tarjeta junto al resumen de dinero (no dentro de
+        # la gráfica, donde tapaba las líneas).
+        self._render_legend(legend_entries)
         if any_data:
-            legend = self.ax.legend(
-                loc="upper left", facecolor=c["bg_card_hover"], edgecolor="none", framealpha=0.9, fontsize=9
-            )
-            for text in legend.get_texts():
-                text.set_color(c["text_primary"])
             self.ax.set_title(
                 "Evolución comparada (base 100)" if self.normalize_var.get() else "Evolución comparada",
                 color=c["text_primary"], fontsize=14, loc="left", fontweight="bold", pad=12,
