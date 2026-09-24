@@ -43,10 +43,11 @@ USER_BTN_FONT = ("Segoe UI Semibold", 13)
 THEME_COL_W = 270
 OPTION_TEXT_W = 270
 # Hueco mínimo entre la barra de vistas (Fondo individual, Vista global…) y el
-# recuadro de su derecha, y los anchos de ventana que lo respetan.
+# recuadro de su derecha, y los anchos de ventana que lo respetan. La fila de los
+# periodos + "Ver juntas 3 4 5 6" es la parte más ancha de la cabecera (~485 px).
 HEADER_GAP = 60
-WINDOW_W = 1220
-WINDOW_MIN_W = 1140
+WINDOW_W = 1320
+WINDOW_MIN_W = 1240
 
 ctk.set_default_color_theme("dark-blue")
 ctk.set_widget_scaling(UI_SCALING)
@@ -101,6 +102,9 @@ VIEW_LABELS = {"individual": "Fondo individual", "global": "Vista global", "repa
                "rentabilidades": "Rentabilidades"}
 # Vistas que no son una gráfica temporal: sin selector de periodos ni indicador.
 SNAPSHOT_VIEWS = ("reparto", "rentabilidades")
+# Vistas especiales "multi": las N primeras gráficas de la lista a la vez. Sus
+# botones van en la barra de periodos, a continuación de los meses/años.
+MULTI_COUNTS = (3, 4, 5, 6)
 
 # Columnas de la tabla de rentabilidades: (clave, cabecera, ancho lógico). "YTD"
 # se muestra como el año en curso; "name" es flexible y ocupa lo que sobre.
@@ -291,6 +295,23 @@ def _portfolio_totals(funds):
         "currency": next(iter(currencies)) if len(currencies) == 1 else "EUR",
         "currencies": currencies, "funds": with_movs,
     }
+
+
+def _fit_mpl_text(text_artist, full, max_px, renderer):
+    """Como _fit_text, pero para un texto de matplotlib: lo deja escrito en
+    `text_artist`, recortado con "…" para que mida como mucho `max_px` px."""
+    text_artist.set_text(full)
+    if text_artist.get_window_extent(renderer).width <= max_px:
+        return
+    lo, hi = 0, len(full)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        text_artist.set_text(full[:mid].rstrip() + "…")
+        if text_artist.get_window_extent(renderer).width <= max_px:
+            lo = mid
+        else:
+            hi = mid - 1
+    text_artist.set_text(full[:lo].rstrip() + "…")
 
 
 def _parse_es_number(text):
@@ -1439,6 +1460,9 @@ class MisFondosApp:
         self.view_mode = tk.StringVar(value="individual")
         self.period = tk.StringVar(value="6M")
         self.normalize_var = tk.BooleanVar(value=True)
+        self.multi_count = MULTI_COUNTS[0]  # cuántas gráficas en la vista "multi"
+        self._multi_panels = []
+        self._multi_info = (0, 0)  # (gráficas dibujadas, fondos en la lista)
         self.selected_fund_id = None
         self.fund_rows = {}
         self._ui_queue = queue.Queue()
@@ -1673,19 +1697,37 @@ class MisFondosApp:
             controls, c, list(VIEW_LABELS.values()), command=self._on_view_switch,
             height=44, font=FONT_BODY, radius=12,
         )
-        self.view_switch.set(VIEW_LABELS[self.view_mode.get()])
+        self.view_switch.set(VIEW_LABELS.get(self.view_mode.get()))  # en "multi", ninguna marcada
         self.view_switch.pack(anchor="w")
 
+        # Fila de abajo: periodos y, a continuación, las vistas de varias gráficas.
+        period_row = ctk.CTkFrame(controls, fg_color="transparent")
+        period_row.pack(anchor="w", pady=(12, 0))
         # "YTD" (year to date) se muestra como el año en curso, igual que MyInvestor.
         # Internamente la clave sigue siendo "YTD"; el mapa se fija al construir la
         # interfaz para que no se descuadre si la app sigue abierta al cambiar de año.
         self._period_by_label = {(str(dt.date.today().year) if k == "YTD" else k): k for k in PERIODS}
         self.period_switch = PillSwitch(
-            controls, c, list(self._period_by_label), command=self._on_period_switch,
+            period_row, c, list(self._period_by_label), command=self._on_period_switch,
             height=38, font=FONT_SMALL, radius=10,
         )
         self.period_switch.set(next(lbl for lbl, k in self._period_by_label.items() if k == self.period.get()))
-        self.period_switch.pack(anchor="w", pady=(12, 0))
+        self.period_switch.pack(side="left")
+
+        self.multi_group = ctk.CTkFrame(period_row, fg_color="transparent")
+        self.multi_group.pack(side="left", padx=(18, 0))
+        multi_caption = ctk.CTkLabel(self.multi_group, text="Ver juntas", font=FONT_SMALL, text_color=c["text_muted"])
+        multi_caption.pack(side="left", padx=(0, 8))
+        self.multi_switch = PillSwitch(
+            self.multi_group, c, [str(n) for n in MULTI_COUNTS], command=self._on_multi_switch,
+            height=38, font=FONT_SMALL, radius=10,
+        )
+        self.multi_switch.set(str(self.multi_count) if self.view_mode.get() == "multi" else None)
+        self.multi_switch.pack(side="left")
+        multi_help = ("Ver a la vez las 3, 4, 5 o 6 primeras gráficas de tu lista de fondos.\n"
+                      "Si son impares, la más grande es la que más rentabilidad da en el periodo elegido.")
+        Tooltip(multi_caption, multi_help, c)
+        Tooltip(self.multi_switch, multi_help, c)
 
         # Lado derecho de la cabecera: en vista individual, el indicador de subida/bajada
         # del último valor liquidativo; en vista global, la casilla de normalizar (que
@@ -1702,6 +1744,9 @@ class MisFondosApp:
                 "cuánto ha subido o bajado cada uno aunque sus precios sean muy distintos.\n"
                 "Ejemplo: 112 = ha ganado un 12 %  ·  95 = ha perdido un 5 %.\n"
                 "Sin marcar se ve el precio real (valor liquidativo) de cada fondo.", c)
+        # En la vista de varias gráficas: qué se está viendo y por qué una es más grande.
+        self.multi_note = ctk.CTkLabel(header, text="", font=FONT_SMALL, text_color=c["text_muted"],
+                                       justify="right", anchor="e", wraplength=260)
         self._build_change_indicator(header)
         self._build_portfolio_strip(main)
 
@@ -1724,6 +1769,7 @@ class MisFondosApp:
         self._hover_dot = None
         self.canvas.mpl_connect("motion_notify_event", self._on_hover)
         self.canvas.mpl_connect("figure_leave_event", self._on_leave_chart)
+        self.canvas.mpl_connect("resize_event", self._on_chart_resize)
 
     # ---------- franja "mi cartera" ----------
     def _build_portfolio_strip(self, parent):
@@ -1998,15 +2044,19 @@ class MisFondosApp:
         if mode != self._header_mode:
             self.indicator_card.pack_forget()
             self.normalize_check.pack_forget()
+            self.multi_note.pack_forget()
             if mode == "individual":
                 self.indicator_card.pack(side="right", anchor="n", padx=(HEADER_GAP, 0))
             elif mode == "global":
                 self.normalize_check.pack(side="right", anchor="n", padx=(HEADER_GAP, 0), pady=(8, 0))
-            # Reparto y rentabilidades son a fecha de hoy: los periodos no aplican.
+            elif mode == "multi":
+                self.multi_note.pack(side="right", anchor="n", padx=(HEADER_GAP, 0), pady=(4, 0))
+            # Reparto y rentabilidades son a fecha de hoy: los periodos no aplican (los
+            # botones de varias gráficas se quedan, para poder llegar a ellas).
             if mode in SNAPSHOT_VIEWS:
                 self.period_switch.pack_forget()
             elif not self.period_switch.winfo_manager():
-                self.period_switch.pack(anchor="w", pady=(12, 0))
+                self.period_switch.pack(side="left", before=self.multi_group)
             # La tabla sustituye a la gráfica (se ocultan, nunca se destruyen).
             if mode == "rentabilidades":
                 self.chart_card.pack_forget()
@@ -2016,6 +2066,8 @@ class MisFondosApp:
                 if not self.chart_card.winfo_manager():
                     self.chart_card.pack(fill="both", expand=True, padx=24, pady=(14, 20))
             self._header_mode = mode
+        if mode == "multi":
+            self.multi_note.configure(text=self._multi_note_text())
         if mode != "individual":
             return
 
@@ -2050,9 +2102,28 @@ class MisFondosApp:
                 text_color=p_color,
             )
 
+    def _multi_note_text(self):
+        shown, total = self._multi_info
+        phrase = PERIOD_PHRASES.get(self.period.get(), "").lower()
+        lines = []
+        if total < self.multi_count:
+            lines.append(f"Solo hay {total} fondo{'s' if total != 1 else ''} en tu lista.")
+        if shown >= 3 and shown % 2:
+            lines.append(f"La gráfica grande es la de más rentabilidad {phrase}.")
+        elif shown >= 2:
+            lines.append(f"Junto a cada nombre, su rentabilidad {phrase}.")
+        return "\n".join(lines)
+
     def _on_view_switch(self, value):
         mode = next((k for k, lbl in VIEW_LABELS.items() if lbl == value), "individual")
+        self.multi_switch.set(None)
         self.view_mode.set(mode)
+        self._redraw()
+
+    def _on_multi_switch(self, value):
+        self.multi_count = int(value)
+        self.view_switch.set(None)  # es otra vista: ninguna de las de arriba queda marcada
+        self.view_mode.set("multi")
         self._redraw()
 
     def _on_period_switch(self, value):
@@ -2195,54 +2266,75 @@ class MisFondosApp:
         self.root.after(250, self._poll_ui_queue)
 
     # ---------- dibujado ----------
-    def _style_axes(self):
+    def _style_axes(self, ax, max_ticks=None):
+        """Estilo común de una gráfica. `max_ticks` limita las fechas del eje X en
+        las gráficas pequeñas de la vista multi (si no, se pisan unas con otras)."""
         c = self.colors
-        self.ax.clear()
+        ax.clear()
         # El anillo del reparto quita los ejes y fija aspecto 1:1; se restauran aquí.
-        self.ax.set_axis_on()
-        self.ax.set_aspect("auto")
-        self._pie_wedges = []
-        self.ax.set_facecolor(c["bg_card"])
-        self.ax.tick_params(colors=c["text_muted"], labelsize=9)
-        for spine in self.ax.spines.values():
+        ax.set_axis_on()
+        ax.set_aspect("auto")
+        ax.set_facecolor(c["bg_card"])
+        ax.tick_params(colors=c["text_muted"], labelsize=8 if max_ticks else 9)
+        for spine in ax.spines.values():
             spine.set_visible(False)
-        self.ax.grid(True, color=c["grid"], linewidth=0.6, axis="y")
-        self.ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+        ax.grid(True, color=c["grid"], linewidth=0.6, axis="y")
+        if max_ticks:
+            ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=2, maxticks=max_ticks))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+
+    def _make_hover_artists(self, ax):
+        """Punto y bocadillo del tooltip de una gráfica, ocultos hasta pasar el ratón.
+        Se crean en cada redibujado: ax.clear() / fig.clear() borran los anteriores."""
+        c = self.colors
+        (dot,) = ax.plot([], [], marker="o", markersize=6, linestyle="none",
+                         color=c["text_primary"], zorder=5, visible=False)
+        ann = ax.annotate(
+            "", xy=(0, 0), xytext=(14, 14), textcoords="offset points",
+            bbox=dict(boxstyle="round,pad=0.5", fc=c["bg_card_hover"], ec=c["border"], lw=1),
+            color=c["text_primary"], fontsize=9, visible=False, zorder=6,
+        )
+        return dot, ann
+
+    def _use_single_axes(self):
+        """Vuelve a una sola gráfica si antes estaba la vista multi (que las borró)."""
+        if self.fig.axes != [self.ax]:
+            self.fig.clear()
+            self.ax = self.fig.add_subplot(111)
 
     def _redraw(self):
         if self._rebuilding:
             return
         try:
-            self._style_axes()
             self._plot_series = []
+            self._pie_wedges = []
+            self._multi_panels = []
             self._indicator = None
             funds = store.list_funds()
 
             mode = self.view_mode.get()
-            if mode == "individual":
-                self._draw_individual(funds)
-            elif mode == "global":
-                self._draw_global(funds)
-            elif mode == "reparto":
-                self._draw_allocation(funds)
+            if mode == "multi":
+                self._hover_dot = self._hover_ann = None  # eran de la gráfica única, ya borrada
+                self._draw_multi(funds)
             else:
-                self._render_returns_table(funds)
+                self._use_single_axes()
+                self._style_axes(self.ax)
+                if mode == "individual":
+                    self._draw_individual(funds)
+                elif mode == "global":
+                    self._draw_global(funds)
+                elif mode == "reparto":
+                    self._draw_allocation(funds)
+                else:
+                    self._render_returns_table(funds)
+                self._hover_dot, self._hover_ann = self._make_hover_artists(self.ax)
             self._update_header()
             self._update_portfolio_strip()
             self._update_tray_title()
 
-            c = self.colors
-            (self._hover_dot,) = self.ax.plot(
-                [], [], marker="o", markersize=6, linestyle="none",
-                color=c["text_primary"], zorder=5, visible=False,
-            )
-            self._hover_ann = self.ax.annotate(
-                "", xy=(0, 0), xytext=(14, 14), textcoords="offset points",
-                bbox=dict(boxstyle="round,pad=0.5", fc=c["bg_card_hover"], ec=c["border"], lw=1),
-                color=c["text_primary"], fontsize=9, visible=False, zorder=6,
-            )
-
-            if mode == "reparto":
+            if mode == "multi":
+                self._layout_multi()
+            elif mode == "reparto":
                 # Anillo a la izquierda y leyenda a la derecha (fuera del eje):
                 # tight_layout no reserva sitio para una leyenda exterior.
                 self.fig.subplots_adjust(left=0.02, right=0.52, top=0.9, bottom=0.06)
@@ -2251,6 +2343,16 @@ class MisFondosApp:
             self.canvas.draw_idle()
         except Exception:
             applog.log_exception("Fallo al redibujar la gráfica")
+
+    def _on_chart_resize(self, _event):
+        """Al cambiar el tamaño de la ventana, los nombres de la vista multi se
+        vuelven a recortar al ancho nuevo de cada gráfica."""
+        if self._rebuilding or self.view_mode.get() != "multi" or not self._multi_panels:
+            return
+        try:
+            self._layout_multi()
+        except Exception:
+            applog.log_exception("Fallo al recolocar la vista de varias gráficas")
 
     def _on_leave_chart(self, _event):
         if self._rebuilding:
@@ -2261,10 +2363,32 @@ class MisFondosApp:
             applog.log_exception("Fallo al ocultar el tooltip de la gráfica")
 
     def _hide_hover(self):
-        if self._hover_ann is not None and self._hover_ann.get_visible():
-            self._hover_ann.set_visible(False)
-            self._hover_dot.set_visible(False)
+        changed = False
+        pairs = [(self._hover_ann, self._hover_dot)] + [(p["ann"], p["dot"]) for p in self._multi_panels]
+        for ann, dot in pairs:
+            if ann is not None and ann.get_visible():
+                ann.set_visible(False)
+                dot.set_visible(False)
+                changed = True
+        if changed:
             self.canvas.draw_idle()
+
+    def _place_hover(self, ax, ann, dot, x, y, color, text, x_cursor):
+        """Muestra el bocadillo junto al punto (x, y), siempre hacia el centro de la
+        gráfica para que no se salga por el borde."""
+        ann.set_text(text)
+        ann.xy = (x, y)
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+        dx = 14 if x_cursor < (xlim[0] + xlim[1]) / 2 else -14
+        dy = 14 if y < (ylim[0] + ylim[1]) / 2 else -14
+        ann.xyann = (dx, dy)
+        ann.set_ha("left" if dx > 0 else "right")
+        ann.set_va("bottom" if dy > 0 else "top")
+        ann.set_visible(True)
+        dot.set_data([x], [y])
+        dot.set_color(color)
+        dot.set_visible(True)
 
     def _on_hover(self, event):
         if self._rebuilding:
@@ -2275,6 +2399,9 @@ class MisFondosApp:
             applog.log_exception("Fallo en el tooltip de la gráfica")
 
     def _do_hover(self, event):
+        if self.view_mode.get() == "multi":
+            self._hover_multi(event)
+            return
         if self._hover_ann is not None and self.view_mode.get() == "reparto":
             self._hover_pie(event)
             return
@@ -2303,24 +2430,32 @@ class MisFondosApp:
             return
 
         header = mdates.num2date(ref_num).strftime("%d %b %Y")
-        self._hover_ann.set_text(header + "\n" + "\n".join(lines))
-        self._hover_ann.xy = (dot_x, dot_y)
+        self._place_hover(self.ax, self._hover_ann, self._hover_dot, dot_x, dot_y, dot_color,
+                          header + "\n" + "\n".join(lines), x_cursor)
+        self.canvas.draw_idle()
 
-        xlim = self.ax.get_xlim()
-        ylim = self.ax.get_ylim()
-        dx = 14 if x_cursor < (xlim[0] + xlim[1]) / 2 else -14
-        dy = 14 if dot_y < (ylim[0] + ylim[1]) / 2 else -14
-        ha = "left" if dx > 0 else "right"
-        va = "bottom" if dy > 0 else "top"
-        self._hover_ann.xyann = (dx, dy)
-        self._hover_ann.set_ha(ha)
-        self._hover_ann.set_va(va)
-        self._hover_ann.set_visible(True)
-
-        self._hover_dot.set_data([dot_x], [dot_y])
-        self._hover_dot.set_color(dot_color)
-        self._hover_dot.set_visible(True)
-
+    def _hover_multi(self, event):
+        """Tooltip de la vista multi: solo en la gráfica que está bajo el ratón."""
+        panel = next((p for p in self._multi_panels if p["ax"] is event.inaxes), None)
+        changed = False
+        for p in self._multi_panels:
+            if p is not panel and p["ann"].get_visible():
+                p["ann"].set_visible(False)
+                p["dot"].set_visible(False)
+                changed = True
+        series = panel["series"] if panel else None
+        if series is None or event.xdata is None or len(series["xnum"]) == 0:
+            if changed:
+                self.canvas.draw_idle()
+            return
+        idx = (abs(series["xnum"] - event.xdata)).argmin()
+        x, y = series["xnum"][idx], series["values"][idx]
+        text = f"{mdates.num2date(x):%d %b %Y}\n{_fmt_es(y, _nav_decimals(y))}"
+        # La gráfica activa se dibuja la última: si el bocadillo asoma sobre la de
+        # al lado, queda por encima de ella y no tapado por su fondo.
+        for p in self._multi_panels:
+            p["ax"].set_zorder(1 if p is panel else 0)
+        self._place_hover(panel["ax"], panel["ann"], panel["dot"], x, y, series["color"], text, event.xdata)
         self.canvas.draw_idle()
 
     def _draw_individual(self, funds):
@@ -2476,6 +2611,96 @@ class MisFondosApp:
             )
         else:
             self.ax.text(0.5, 0.5, "Sin datos todavía", color=c["text_muted"], ha="center", va="center")
+
+    def _draw_multi(self, funds):
+        """Las N primeras gráficas de la lista a la vez, en 2 filas. Con un número
+        par, todas del mismo tamaño. Con uno impar, la que más rentabilidad da en el
+        periodo elegido ocupa la columna de la izquierda entera (el doble que las
+        demás) y el resto se reparte a partes iguales: 3 → 1 grande + 2, 5 → 1 + 4."""
+        c = self.colors
+        period = self.period.get()
+        self.fig.clear()
+        items = []
+        for f in funds[:self.multi_count]:
+            df = data_fetcher.load_history(f["id"])
+            closes = df["Close"].dropna() if not df.empty else None
+            items.append({"fund": f, "df": df, "ret": metrics.period_return(closes, period)})
+        self._multi_info = (len(items), len(funds))
+        if not items:
+            ax = self.fig.add_subplot(111)
+            self._style_axes(ax)
+            ax.set_axis_off()
+            ax.text(0.5, 0.5, "Añade fondos para ver varias gráficas a la vez", color=c["text_muted"],
+                    ha="center", va="center", transform=ax.transAxes)
+            return
+
+        n = len(items)
+        rows, cols = (1, n) if n <= 2 else (2, (n + 1) // 2)
+        grid = self.fig.add_gridspec(rows, cols)
+        big = None
+        if n >= 3 and n % 2:
+            # La de más rentabilidad; las que no tienen dato cuentan como las peores
+            # y, a igualdad, gana la primera de la lista.
+            big = max(items, key=lambda it: (it["ret"] is not None, it["ret"] or 0.0))
+            ordered = [big] + [it for it in items if it is not big]
+            cells = [grid[:, 0]] + [grid[r, k] for r in range(rows) for k in range(1, cols)]
+        else:
+            ordered = items
+            cells = [grid[r, k] for r in range(rows) for k in range(cols)]
+        max_ticks = 5 if cols <= 2 else 4
+        for item, cell in zip(ordered, cells):
+            self._draw_panel(self.fig.add_subplot(cell), item, item is big, max_ticks)
+
+    def _draw_panel(self, ax, item, big, max_ticks):
+        """Una gráfica de la vista multi: nombre a la izquierda y rentabilidad del
+        periodo a la derecha (el nombre se recorta luego en _layout_multi)."""
+        c = self.colors
+        fund, df = item["fund"], item["df"]
+        self._style_axes(ax, max_ticks=max_ticks)
+        size = 13 if big else 11
+        name = fund["name"].strip()
+        title = ax.set_title(name, loc="left", color=c["text_primary"], fontsize=size, fontweight="bold", pad=8)
+        if item["ret"] is None:
+            ret_text, ret_color = "—", c["text_muted"]
+        else:
+            arrow, ret_color = self._direction_style(item["ret"])
+            ret_text = f"{arrow} {_fmt_pct(item['ret'])}"
+        ret_title = ax.set_title(ret_text, loc="right", color=ret_color, fontsize=size - 1, fontweight="bold", pad=8)
+
+        series = None
+        if df.empty:
+            ax.text(0.5, 0.5, "Sin datos todavía", color=c["text_muted"], ha="center", va="center",
+                    transform=ax.transAxes)
+        else:
+            start = _period_start(df, self.period.get())
+            view = df[df.index >= start] if start is not None else df
+            ax.plot(view.index, view["Close"], color=fund["color"], linewidth=2.2 if big else 1.8)
+            ax.fill_between(view.index, view["Close"], view["Close"].min(), color=fund["color"], alpha=0.08)
+            series = {
+                "color": fund["color"],
+                "xnum": mdates.date2num(view.index.to_pydatetime()), "values": view["Close"].to_numpy(),
+            }
+        dot, ann = self._make_hover_artists(ax)
+        self._multi_panels.append({"ax": ax, "name": name, "title": title, "ret_title": ret_title,
+                                   "series": series, "dot": dot, "ann": ann, "big": big})
+
+    def _layout_multi(self):
+        """Reparte el hueco entre las gráficas y recorta cada nombre con "…" para que
+        quepa junto a su rentabilidad (depende del tamaño de la ventana)."""
+        panels = self._multi_panels
+        # Se colocan con un nombre corto de la misma altura: si no, un nombre largo
+        # desborda su gráfica y tight_layout encoge todas para hacerle sitio.
+        for p in panels:
+            p["title"].set_text("Ag")
+        self.fig.tight_layout(h_pad=1.5, w_pad=2.5)
+        if not panels:
+            return
+        renderer = self.canvas.get_renderer()
+        gap = 10 * self.fig.dpi / 72  # 10 pt entre el nombre y la rentabilidad
+        for p in panels:
+            room = (p["ax"].get_window_extent(renderer).width
+                    - p["ret_title"].get_window_extent(renderer).width - gap)
+            _fit_mpl_text(p["title"], p["name"], room, renderer)
 
 
 def run():
